@@ -672,6 +672,7 @@ def register_test_runner(
 def build_agent_bundle(
     name: str,
     description: str | None = None,
+    short_description: str | None = None,
     sub_agents: list[dict[str, Any]] | None = None,
     max_iterations: int | None = None,
     executor: dict[str, Any] | None = None,
@@ -690,6 +691,7 @@ def build_agent_bundle(
 
     :param name: Agent name, e.g. ``"test-agent"``.
     :param description: Optional description.
+    :param short_description: Optional one-line picker blurb.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
         ``[{"name": "researcher", "description": "..."}]``.
@@ -733,6 +735,8 @@ def build_agent_bundle(
         }
     if description is not None:
         config["description"] = description
+    if short_description is not None:
+        config["short_description"] = short_description
     if guardrails is not None:
         config["guardrails"] = guardrails
     if terminals is not None:

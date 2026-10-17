@@ -143,6 +143,20 @@ class BackgroundTitleContext:
     # Set by the dispatch layer to pin the generation onto the harness's
     # economy tier; generators prefer it over every other model source.
     title_model: str | None = None
+    # Replaces the title prompt for another isolated one-shot judgment on the
+    # same economy model, e.g. the Smart Routing host judge's rubric.
+    instructions: str | None = None
+
+
+def generation_instructions(context: BackgroundTitleContext) -> str:
+    """Return the system instructions an isolated generator should send.
+
+    :param context: The resolved generation inputs.
+    :returns: ``context.instructions`` when set, else the title prompt.
+    """
+    return context.instructions or build_background_title_instructions(
+        context.additional_instructions
+    )
 
 
 class BackgroundTitleGenerator(Protocol):

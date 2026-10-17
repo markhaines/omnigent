@@ -2227,6 +2227,7 @@ def create_runner_app(
         sub_agent_name: str | None = None,
         additional_instructions: str | None = None,
         instructions: str | None = None,
+        economy_only: bool = False,
     ) -> BackgroundTitleContext | JSONResponse | None:
         """Resolve the session's harness into an isolated one-shot generation context.
 
@@ -2295,6 +2296,7 @@ def create_runner_app(
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
             additional_instructions=additional_instructions,
             instructions=instructions,
+            economy_only=economy_only,
         )
 
     @app.post(
@@ -2373,6 +2375,7 @@ def create_runner_app(
             conversation_id,
             prompt=body.message,
             instructions=body.instructions,
+            economy_only=True,
         )
         if context is None:
             return RoutingJudgeResponse(status="unsupported")

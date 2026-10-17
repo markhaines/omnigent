@@ -146,6 +146,9 @@ class BackgroundTitleContext:
     # Replaces the title prompt for another isolated one-shot judgment on the
     # same economy model, e.g. the Smart Routing host judge's rubric.
     instructions: str | None = None
+    # Run on the economy model only, never retrying on the session's own
+    # (possibly premium) model; the routing judge sets this and fails open.
+    economy_only: bool = False
 
 
 def generation_instructions(context: BackgroundTitleContext) -> str:
@@ -190,6 +193,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         raise RuntimeError(f"background title generator {spec.generator!r} is not callable")
     typed_generator = cast(BackgroundTitleGenerator, generator)
     title_model = background_title_model(context.harness)
+    if context.economy_only:
+        economy_model = context.title_model or title_model
+        if economy_model is None:
+            return None
+        return await typed_generator(replace(context, title_model=economy_model))
     if title_model is not None and context.title_model is None:
         try:
             title = await typed_generator(replace(context, title_model=title_model))

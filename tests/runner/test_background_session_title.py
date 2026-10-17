@@ -580,6 +580,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
     assert "ANTHROPIC_API_KEY" not in captured["kwargs"]["env"]
     assert "ANTHROPIC_AUTH_TOKEN" not in captured["kwargs"]["env"]
+    # Print mode waits ~3s on an inherited stdin pipe before it starts.
+    assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.asyncio

@@ -1173,6 +1173,45 @@ async def test_background_title_dispatch_retries_with_session_model_after_econom
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("economy_fails_by", ["raising", "returning_none"])
+async def test_economy_only_dispatch_never_retries_on_the_session_model(
+    monkeypatch: pytest.MonkeyPatch,
+    economy_fails_by: str,
+) -> None:
+    """The routing judge's path: a failed economy call is the answer, not a retry."""
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str | None:
+        attempted_models.append(context.title_model)
+        if economy_fails_by == "raising":
+            raise RuntimeError("not logged in")
+        return None
+
+    _register_fake_title_generator(monkeypatch, "claude-native", generate_title)
+    context = _title_context("claude-native", economy_only=True)
+
+    if economy_fails_by == "raising":
+        with pytest.raises(RuntimeError):
+            await title_service.generate_background_title(context)
+    else:
+        assert await title_service.generate_background_title(context) is None
+    assert attempted_models == ["haiku"]
+
+
+@pytest.mark.asyncio
+async def test_economy_only_dispatch_skips_a_harness_with_no_economy_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        raise AssertionError("the session model must not run")
+
+    _register_fake_title_generator(monkeypatch, "pi", generate_title)
+
+    context = _title_context("pi", economy_only=True)
+    assert await title_service.generate_background_title(context) is None
+
+
+@pytest.mark.asyncio
 async def test_background_title_dispatch_retries_after_empty_economy_title(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1451,6 +1490,7 @@ async def test_routing_judge_answers_the_rubric_with_the_sessions_own_cli(
     assert (context.prompt, context.instructions) == ("what does git stash pop do?", "RUBRIC")
     # The economy model is pinned by the shared dispatch, not the caller.
     assert context.title_model == background_title_model("claude-native")
+    assert context.economy_only
 
 
 @pytest.mark.asyncio

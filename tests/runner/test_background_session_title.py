@@ -525,6 +525,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+    # Print mode waits ~3s on an inherited stdin pipe before it starts.
+    assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.asyncio

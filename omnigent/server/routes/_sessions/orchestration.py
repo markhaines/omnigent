@@ -6621,7 +6621,10 @@ async def _native_turn_catalog(
         raw = option.get("model") or option.get("id")
         if isinstance(raw, str) and raw and raw not in models:
             models.append(raw)
-    return models or None
+    # The rubric reads list position as cost; picker order is not cost order.
+    from omnigent.server.smart_routing import order_by_model_line_cost
+
+    return order_by_model_line_cost(models) or None
 
 
 def _routed_turn_model_spelling(

@@ -401,11 +401,9 @@ _AGY_SKILL_DIRS = (
 )
 
 
-# agy's global rules, relative to the Gemini dir: the standalone ``GEMINI.md`` /
-# ``AGENTS.md`` files at its root and under ``config/``, plus the always-on rules in
-# ``config/rules/``. agy reads all of them from the ``--gemini_dir`` it runs under
-# (live-verified, agy 1.3.4), so without links a session starts with none of the
-# user's global rules while their interactive agy has them.
+# agy reads global rules (root/config GEMINI.md / AGENTS.md plus config/rules/) only
+# from the --gemini_dir it runs under, so without these links a session starts with
+# none of the rules the user's interactive agy applies.
 _AGY_GLOBAL_RULE_PATHS = (
     Path("GEMINI.md"),
     Path("AGENTS.md"),

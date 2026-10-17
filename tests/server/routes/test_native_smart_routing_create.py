@@ -1820,6 +1820,51 @@ async def test_turn_catalog_uses_pi_native_pushed_registry() -> None:
         _pushed_model_options_cache.pop(session_id, None)
 
 
+async def test_codex_turn_catalog_is_the_panes_model_list() -> None:
+    """A codex pane's turn candidates are its own ``model/list`` ids, fetched when cold."""
+    from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_codex_vocab"
+    conv = SimpleNamespace(
+        id=session_id, labels={"omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label}
+    )
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"id": "gpt-5.5", "model": "gpt-5.5", "isDefault": True},
+                    {"id": "gpt-5.4-mini", "model": "gpt-5.4-mini"},
+                ]
+            },
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        # Nothing cached yet (no picker opened, prefetch not landed): the turn
+        # fetches the pane's catalog rather than routing with no candidates.
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "gpt-5.5",
+            "gpt-5.4-mini",
+        ]
+        assert requested == [f"/v1/sessions/{session_id}/model-options"]
+        # Codex takes its model ids verbatim, so the pick needs no respelling.
+        assert _routed_turn_model_spelling(session_id, conv, "gpt-5.4-mini") == "gpt-5.4-mini"
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+
+
 async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
     from omnigent.server.routes._sessions.orchestration import (
         _model_options_cache,

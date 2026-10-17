@@ -719,6 +719,12 @@ def _verdict_json(text: str) -> Any:  # type: ignore[explicit-any]  # parsed jud
     return json.loads(text[start : end + 1])
 
 
+#: Why the host judge declines a create: no runner exists yet to run the CLI.
+#: Not a failure, so the create path shows no "unavailable" card for it; the
+#: first-turn hook routes the same prompt once the runner is up.
+HOST_JUDGE_DEFERRED = "the host judge routes the first turn once the runner is up"
+
+
 class HostRoutingClient:
     """Built-in judge answered by the session's HOST, on its own CLI login.
 
@@ -749,7 +755,7 @@ class HostRoutingClient:
         if bound is None:
             # A create routes before its runner exists; the first-turn hook
             # routes the same prompt once the runner is up.
-            self.last_error = "the host judge routes the first turn once the runner is up"
+            self.last_error = HOST_JUDGE_DEFERRED
             return None
         session_id, runner_client = bound
         try:
@@ -2332,6 +2338,8 @@ async def route_session_harness(
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
         detail = routing_last_error(call.client)
+        if detail == HOST_JUDGE_DEFERRED:
+            return None, None, None, HOST_JUDGE_DEFERRED
         reason = (
             f"Routing unavailable: {detail}"
             if detail

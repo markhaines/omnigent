@@ -2428,3 +2428,28 @@ def test_turn_catalog_orders_picker_rows_cheapest_first(
     from omnigent.server.smart_routing import order_by_model_line_cost
 
     assert order_by_model_line_cost(picker) == cheapest_first
+
+
+async def test_a_host_judge_create_defers_without_an_unavailable_card(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The host judge cannot answer before the runner exists, and that is not an outage.
+
+    The first-turn hook routes the same prompt once the runner is up, so the
+    create shows no "unavailable" card and leaves the route-once gate free.
+    """
+    from omnigent.server.smart_routing import HOST_JUDGE_DEFERRED
+
+    wrappers = await _native_wrappers(client, db_uri)
+    created = await _create_fixed_harness_session(
+        client, wrappers["claude-native"], FakeRoutingClient(None, last_error=HOST_JUDGE_DEFERRED)
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override is None
+    assert ROUTING_DECISION_LABEL_KEY not in conv.labels
+    assert _routing_decision_items(db_uri, session_id) == []

@@ -1343,7 +1343,7 @@ def build_native_controls(
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
-            inject_slash_command,
+            inject_model_command,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1425,7 +1425,6 @@ def build_native_controls(
                     ),
                 },
             )
-        command = f"/model {model_arg}"
 
         def _model_failed(exc: BaseException) -> JSONResponse:
             # Always log the full cause; the reply carries it only when actionable.
@@ -1520,21 +1519,15 @@ def build_native_controls(
             )
 
         try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
             await _drive_claude_pane(
                 deadline,
-                inject_slash_command,
+                inject_model_command,
                 bridge_dir,
-                command=command,
+                model_arg=model_arg,
                 timeout_s=1.0,
                 # A boot that used the prompt budget still leaves the injection a
                 # short wait for a torn capture right after the prompt rendered.
                 ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
         except ClaudeInjectionCancelled as exc:
             # The budget can lapse in the dialog watch after ``/model`` was submitted;

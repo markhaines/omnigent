@@ -102,6 +102,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         *launch_args,
         cwd=str(context.cwd) if context.cwd is not None else None,
         env=env,
+        # Print mode otherwise waits ~3s for piped stdin before it starts.
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

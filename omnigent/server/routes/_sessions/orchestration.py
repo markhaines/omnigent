@@ -6537,7 +6537,10 @@ async def _native_turn_catalog(
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         options = _pushed_model_options_cache.get(session_id)
-    elif wrapper in (_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE, _CODEX_NATIVE_WRAPPER_LABEL_VALUE):
+    elif wrapper is not None and wrapper in (
+        _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    ):
         await _refresh_stale_native_model_options(session_id, runner_client, wrapper)
         options = _model_options_cache.get(session_id)
     else:

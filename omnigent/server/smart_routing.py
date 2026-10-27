@@ -781,7 +781,7 @@ class HostRoutingClient:
             text = str(payload.get("text") or "")
             _logger.debug("HostRoutingClient: raw response: %s", text[:500])
             verdict = _verdict_json(text)
-        except Exception as exc:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # fail-open
             _logger.warning("HostRoutingClient: host judge call failed", exc_info=True)
             self.last_error = f"host routing judge failed: {failure_detail(exc)}"
             return None

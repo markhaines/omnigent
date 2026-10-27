@@ -38,6 +38,8 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
+    CAP_HARNESS_ACCOUNTS,
+    CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
@@ -45,6 +47,7 @@ from omnigent.host.frames import (
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostRefreshHarnessesFrame,
     HostStoreSecretFrame,
     classify_launch_refusal,
     encode_host_frame,
@@ -59,8 +62,14 @@ from omnigent.onboarding.harness_install import (
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
-from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.feature_flags import (
+    Feature,
+    FeatureFlags,
+    HarnessInstallGate,
+    harness_install_enabled,
+    resolve_feature_flags,
+)
+from omnigent.server.host_registry import HostConnection, HostRegistry, update_harness_accounts
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -74,10 +83,11 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
+
 
 # Managed `/hosts/{host_id}` requests are slice-keyed to the host-owning replica;
 # self-hosted servers are single-replica. The database CAS remains the fallback.
@@ -124,6 +134,10 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
+# A refresh only probes local CLI state; keep the UI responsive if a host stalls.
+_REFRESH_HARNESSES_TIMEOUT_S = 30.0
+_HARNESS_ACCOUNTS_REFRESH_TIMEOUT_S = 30.0
+_HARNESS_ACCOUNTS_CACHE_S = 60.0
 
 
 # ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
@@ -185,6 +199,27 @@ def _require_harness_setup_support(host_conn: HostConnection, action: str) -> No
     )
 
 
+async def _connected_owned_host(
+    *,
+    request: Request,
+    host_id: str,
+    auth_provider: AuthProvider | None,
+    host_registry: HostRegistry,
+    host_store: HostStore,
+) -> tuple[Host, HostConnection]:
+    """Resolve an owner-authorized host and require its live local tunnel."""
+    user_id = require_user(request, auth_provider)
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host not found")
+    if user_id is not None and host.user_id != user_id:
+        raise HTTPException(status_code=403, detail="not your host")
+    conn = host_registry.get(host.host_id)
+    if conn is None:
+        raise _host_absent_error(host)
+    return host, conn
+
+
 async def _proxy_model_options(
     *,
     host_registry: HostRegistry,
@@ -206,7 +241,7 @@ async def _proxy_model_options(
             status_code=502,
             detail=f"host '{host_conn.host_id}' connection lost",
         ) from exc
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise HTTPException(
             status_code=504,
             detail=(
@@ -274,7 +309,7 @@ async def _proxy_list_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_LIST_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -334,7 +369,7 @@ async def _proxy_create_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -368,7 +403,8 @@ async def _proxy_install_harness(
     :param harness: The UI harness identifier to install, e.g. ``"claude"``.
     :returns: Dict with the result fields: ``status`` (``"ok"`` /
         ``"failed"``), ``configured_harnesses`` (the refreshed readiness map or
-        ``None``), ``gateway_inference`` (the refreshed per-harness
+        ``None``), ``version`` (the installed CLI version or ``None``),
+        ``gateway_inference`` (the refreshed per-harness
         AI-Gateway-backed inference map or ``None``), ``error`` (string or
         ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
@@ -394,7 +430,7 @@ async def _proxy_install_harness(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -406,6 +442,53 @@ async def _proxy_install_harness(
         # Cleanup runs on every path so a cancelled caller doesn't
         # leave an orphan in the pending dict.
         host_conn.pending_installs.pop(request_id, None)
+
+
+async def _proxy_refresh_harnesses(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> dict[str, Any]:
+    """Forward a forced harness-readiness probe and await its result."""
+    request_id = secrets.token_hex(8)
+    return await _proxy_rpc(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        request_id=request_id,
+        pending=host_conn.pending_harness_refreshes,
+        frame=HostRefreshHarnessesFrame(request_id=request_id),
+        timeout_s=_REFRESH_HARNESSES_TIMEOUT_S,
+        action="refresh harnesses",
+    )
+
+
+async def _proxy_rpc(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    request_id: str,
+    pending: dict[str, asyncio.Future[dict[str, Any]]],
+    frame: Any,
+    timeout_s: float,
+    action: str,
+) -> dict[str, Any]:
+    """Send one host frame and settle its correlated future on every path."""
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    pending[request_id] = future
+    try:
+        host_registry.send_text(host_conn, encode_host_frame(frame))
+        return await asyncio.wait_for(future, timeout=timeout_s)
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"host '{host_conn.host_id}' connection lost"
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"host did not {action} within {timeout_s:.0f}s",
+        ) from exc
+    finally:
+        pending.pop(request_id, None)
 
 
 # The credential write is local keychain/file I/O on the host — fast, unlike the
@@ -448,7 +531,7 @@ async def _proxy_store_secret(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -490,7 +573,7 @@ async def _proxy_detect_credentials(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -643,6 +726,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    harness_install: HarnessInstallGate | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -665,10 +749,37 @@ def create_hosts_router(
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
     :param feature_flags: Immutable deployment release-feature snapshot.
         When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
+    :param harness_install: Optional static or per-request harness-install gate.
+        When omitted, the feature snapshot decides.
     :returns: A FastAPI router with host endpoints.
     """
     flags = feature_flags or resolve_feature_flags()
+    harness_install_gate: HarnessInstallGate = (
+        flags.enabled(Feature.HARNESS_INSTALL) if harness_install is None else harness_install
+    )
     router = APIRouter()
+
+    def require_harness_install() -> None:
+        if not harness_install_enabled(harness_install_gate):
+            raise HTTPException(status_code=404, detail="not found")
+
+    async def apply_harness_snapshot(
+        host_id: str,
+        conn: HostConnection,
+        result: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        result_configured = result.get("configured_harnesses")
+        result_accounts = result.get("harness_accounts")
+        if isinstance(result_configured, dict):
+            await asyncio.to_thread(
+                host_store.update_harness_readiness,
+                host_id,
+                result_configured,
+            )
+            conn.hello.configured_harnesses = dict(result_configured)
+        if isinstance(result_accounts, dict):
+            update_harness_accounts(conn, result_accounts)
+        return conn.hello.configured_harnesses, conn.hello.harness_accounts
 
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
@@ -695,6 +806,7 @@ def create_hosts_router(
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
+        harness_setup_enabled = harness_install_enabled(harness_install_gate)
         result: list[dict[str, Any]] = []
         for host in hosts:
             # Status comes from the DB, not host_registry. The registry
@@ -706,27 +818,38 @@ def create_hosts_router(
             # A stored "online" is only trusted if the host was seen
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
-            result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.user_id,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
-                    # Held in memory from the host's connect handshake, not the
-                    # hosts row. ``None`` means this replica has no report yet —
-                    # emitted as-is so a client can tell "unknown" from "not
-                    # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
-                }
-            )
+            conn = host_registry.get(host.host_id)
+            item: dict[str, Any] = {
+                "host_id": host.host_id,
+                "name": host.name,
+                "owner": host.user_id,
+                "status": "online" if host_is_live(host, now=now) else "offline",
+                # Non-None marks a server-managed sandbox host (e.g.
+                # "modal"). Clients use it to hide sandbox-backed
+                # hosts from manual host pickers — they are launch
+                # targets the server creates on demand, not
+                # user-connectable machines.
+                "sandbox_provider": host.sandbox_provider,
+                "configured_harnesses": host.configured_harnesses,
+                # Held in memory from the host's connect handshake, not the
+                # hosts row. ``None`` means this replica has no report yet —
+                # emitted as-is so a client can tell "unknown" from "not
+                # gateway-backed".
+                "gateway_inference": host_registry.gateway_inference(host.host_id),
+                "interactive_shells": host_registry.interactive_shells(host.host_id),
+            }
+            if (
+                harness_setup_enabled
+                and conn is not None
+                and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities
+                and conn.hello.harness_accounts is not None
+            ):
+                item["harness_accounts"] = conn.hello.harness_accounts
+            if harness_setup_enabled:
+                item["harness_accounts_supported"] = bool(
+                    conn is not None and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities
+                )
+            result.append(item)
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
@@ -755,7 +878,9 @@ def create_hosts_router(
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
-        return {
+        conn = host_registry.get(host.host_id)
+        harness_setup_enabled = harness_install_enabled(harness_install_gate)
+        result: dict[str, Any] = {
             "host_id": host.host_id,
             "name": host.name,
             "owner": host.user_id,
@@ -770,6 +895,18 @@ def create_hosts_router(
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
+        if (
+            harness_setup_enabled
+            and conn is not None
+            and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities
+            and conn.hello.harness_accounts is not None
+        ):
+            result["harness_accounts"] = conn.hello.harness_accounts
+        if harness_setup_enabled:
+            result["harness_accounts_supported"] = bool(
+                conn is not None and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities
+            )
+        return result
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
@@ -1136,6 +1273,8 @@ def create_hosts_router(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         try:
@@ -1154,7 +1293,7 @@ def create_hosts_router(
                 future,
                 timeout=launch_timeout_s,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             conn.pending_launches.pop(request_id, None)
             await _rollback_failed_launch()
             raise HTTPException(
@@ -1455,6 +1594,96 @@ def create_hosts_router(
             "path": result.get("path"),
         }
 
+    @router.post("/hosts/{host_id}/harnesses/refresh")
+    async def refresh_host_harnesses(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """Force an immediate full harness-readiness probe on a host."""
+        require_harness_install()
+
+        host, conn = await _connected_owned_host(
+            request=request,
+            host_id=host_id,
+            auth_provider=auth_provider,
+            host_registry=host_registry,
+            host_store=host_store,
+        )
+        _require_harness_setup_support(conn, "refreshing harness readiness")
+        if CAP_REFRESH_HARNESSES not in conn.hello.capabilities:
+            raise OmnigentError(
+                (
+                    f"host '{conn.hello.name}' does not support immediate harness refresh; "
+                    "use the latest readiness reported by the host"
+                ),
+                code=ErrorCode.REFRESH_UNSUPPORTED,
+            )
+
+        result = await _proxy_refresh_harnesses(
+            host_registry=host_registry,
+            host_conn=conn,
+        )
+        if result.get("status") == "failed":
+            raise HTTPException(
+                status_code=502,
+                detail=f"host readiness refresh failed: {result.get('error') or 'unknown error'}",
+            )
+
+        refreshed_gateway = optional_str_bool_map(result, "gateway_inference")
+        if refreshed_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, refreshed_gateway)
+        refreshed_configured, refreshed_accounts = await apply_harness_snapshot(
+            host.host_id, conn, result
+        )
+        return {
+            "configured_harnesses": refreshed_configured,
+            "harness_accounts": refreshed_accounts,
+            "gateway_inference": refreshed_gateway,
+        }
+
+    @router.post("/hosts/{host_id}/harnesses/accounts/refresh")
+    async def refresh_host_harness_accounts(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """Probe non-secret harness accounts, using a recent connection result."""
+        require_harness_install()
+        _host, conn = await _connected_owned_host(
+            request=request,
+            host_id=host_id,
+            auth_provider=auth_provider,
+            host_registry=host_registry,
+            host_store=host_store,
+        )
+        if CAP_HARNESS_ACCOUNTS not in conn.hello.capabilities:
+            raise HTTPException(
+                status_code=409,
+                detail="this host does not support harness account probes",
+            )
+        try:
+            result = await host_registry.request_harness_accounts(
+                conn,
+                refresh_codex=False,
+                timeout_s=_HARNESS_ACCOUNTS_REFRESH_TIMEOUT_S,
+                max_age_s=_HARNESS_ACCOUNTS_CACHE_S,
+            )
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{conn.host_id}' connection lost",
+            ) from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="host did not probe harness accounts within 30s",
+            ) from exc
+        if result.get("status") != "ok":
+            raise HTTPException(
+                status_code=502,
+                detail=result.get("error") or "host account probe failed",
+            )
+        return {"harness_accounts": conn.hello.harness_accounts}
+
     @router.post("/hosts/{host_id}/harnesses/{harness}/install")
     async def install_host_harness(
         request: Request,
@@ -1480,7 +1709,8 @@ def create_hosts_router(
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param harness: Harness identifier to install, e.g. ``"claude"``.
         :returns: ``{"object": "harness_install", "harness": ...,
-            "configured_harnesses": {...}, "gateway_inference": {...} | None}``
+            "configured_harnesses": {...}, "version": str | None,
+            "gateway_inference": {...} | None}``
             — the host's refreshed readiness map so the UI can flip the badge
             without a reconnect, plus its refreshed gateway-inference map
             (``None`` when the host didn't report one).
@@ -1492,8 +1722,7 @@ def create_hosts_router(
         """
         # A disabled route is indistinguishable from a non-existent one, so
         # the feature is fully dark until the deployment opts in.
-        if not flags.enabled(Feature.HARNESS_INSTALL):
-            raise HTTPException(status_code=404, detail="not found")
+        require_harness_install()
 
         # Allowlist (400) is checked before the ownership check (403) so error
         # codes can't be used to enumerate host ownership. Never trust the
@@ -1561,11 +1790,16 @@ def create_hosts_router(
         installed_gateway = optional_str_bool_map(result, "gateway_inference")
         if installed_gateway is not None:
             host_registry.record_gateway_inference(host.host_id, installed_gateway)
+        installed_configured, installed_accounts = await apply_harness_snapshot(
+            host.host_id, conn, result
+        )
 
         return {
             "object": "harness_install",
             "harness": harness,
-            "configured_harnesses": result.get("configured_harnesses") or {},
+            "configured_harnesses": installed_configured,
+            "harness_accounts": installed_accounts,
+            "version": result.get("version"),
             # Passed through as-is: ``None`` is "unknown", not "none backed".
             "gateway_inference": installed_gateway,
         }
@@ -1607,8 +1841,7 @@ def create_hosts_router(
             the owner, 409 when offline or the host daemon is too old to store
             credentials, 502 on host-side failure, 504 on timeout.
         """
-        if not flags.enabled(Feature.HARNESS_INSTALL):
-            raise HTTPException(status_code=404, detail="not found")
+        require_harness_install()
 
         # Allowlist before ownership (403) so error codes can't enumerate
         # ownership. Gate on the credential-CONFIGURABLE set (Claude/Codex/Pi),
@@ -1673,11 +1906,15 @@ def create_hosts_router(
         written_gateway = optional_str_bool_map(result, "gateway_inference")
         if written_gateway is not None:
             host_registry.record_gateway_inference(host.host_id, written_gateway)
+        written_configured, written_accounts = await apply_harness_snapshot(
+            host.host_id, conn, result
+        )
 
         return {
             "object": "harness_credential",
             "harness": harness,
-            "configured_harnesses": result.get("configured_harnesses") or {},
+            "configured_harnesses": written_configured,
+            "harness_accounts": written_accounts,
             # Passed through as-is: ``None`` is "unknown", not "none backed".
             "gateway_inference": written_gateway,
         }
@@ -1702,8 +1939,7 @@ def create_hosts_router(
             the owner, 409 when offline or the host daemon is too old to detect
             credentials, 502/504 on host failure/timeout.
         """
-        if not flags.enabled(Feature.HARNESS_INSTALL):
-            raise HTTPException(status_code=404, detail="not found")
+        require_harness_install()
 
         user_id = require_user(request, auth_provider)
 

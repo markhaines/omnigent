@@ -1812,9 +1812,10 @@ async def test_turn_catalog_uses_pi_native_pushed_registry() -> None:
         {"id": "omnigent-openai/system.ai.gpt-5-4-mini", "displayName": "mini"},
     ]
     try:
+        # Cheapest line first: the judge reads list position as cost.
         assert await _native_turn_catalog(session_id, conv) == [
-            "omnigent/databricks-claude-opus-4-8",
             "omnigent-openai/system.ai.gpt-5-4-mini",
+            "omnigent/databricks-claude-opus-4-8",
         ]
     finally:
         _pushed_model_options_cache.pop(session_id, None)

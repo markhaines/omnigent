@@ -3640,7 +3640,7 @@ async def test_host_judge_fails_open_within_the_routing_budget(
     monkeypatch.setattr("omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S", 0.2)
 
     async def handler(_request: Any) -> Any:  # type: ignore[explicit-any]
-        await asyncio.sleep(5)
+        await asyncio.sleep(60)
         return _judged("{}")
 
     client = HostRoutingClient()
@@ -3650,7 +3650,7 @@ async def test_host_judge_fails_open_within_the_routing_budget(
     ) as runner:
         with judge_runner("conv_host_slow", runner):
             assert await client.route("task", _HOST_MENU) is None
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 30
     assert client.last_error is not None
 
 

@@ -652,7 +652,9 @@ def _result_from_verdict(
         )
 
     if chosen_harness is not None:
-        model = _reconcile_with_stated_tier(model, str(rationale), available_models[chosen_harness])
+        model = _reconcile_with_stated_tier(
+            model, str(rationale), available_models[chosen_harness]
+        )
     return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness), None
 
 

@@ -611,7 +611,7 @@ def _result_from_verdict(
     :returns: ``(result, None)``, or ``(None, reason)`` when nothing usable came back.
     """
     if not isinstance(verdict, dict):
-        return None, "routing judge returned no model"
+        return None, "routing judge returned a non-object verdict"
     flat = _flatten_models(available_models)
     model = verdict.get("model")
     rationale = verdict.get("rationale", "")

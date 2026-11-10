@@ -1112,11 +1112,11 @@ type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 // Harness icon kinds preferred for the picker's inline list, in display order.
 // A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
 // list from whatever is launchable rather than showing an empty group.
-const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
+const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex", "antigravity"];
 // Preferred order within the "Other..." submenu.
 const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
 // How many rows the backfill promotes — matches the inline list's usual size.
-const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
+const INLINE_HARNESS_FALLBACK = 3;
 
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (

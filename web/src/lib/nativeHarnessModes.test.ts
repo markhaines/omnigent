@@ -19,6 +19,8 @@ describe("permissionModeConcept", () => {
   it("supports native harness aliases", () => {
     expect(permissionModeConcept("native-codex", "read-only")).toBe("read-only");
     expect(permissionModeConcept("native-agy", "skip")).toBe("full-access");
+    expect(permissionModeConcept("native-agy", "accept-edits")).toBe("edit-automatic");
+    expect(permissionModeConcept("native-agy", "plan")).toBe("read-only");
   });
 
   it("canonicalizes reversed native harness aliases", () => {

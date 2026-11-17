@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -184,6 +185,55 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
             else:
                 assert process.returncode == (127 if failure == "missing" else 126), output
                 assert b"cannot exec" in output
+            assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_relay_exits_when_child_never_becomes_reapable(tmp_path: Path) -> None:
+    """A child stuck exiting (never reapable, even after SIGKILL) cannot keep the relay alive."""
+    state_file = tmp_path / "status.json"
+    # Inject only the unreapable child: WNOHANG never reports it, a blocking wait never returns.
+    wrapper = (
+        "import os,time\n"
+        "from omnigent.terminals.program_status import main\n"
+        "def wedged_waitpid(pid, options):\n"
+        " if options & os.WNOHANG:\n"
+        "  return 0, 0\n"
+        " time.sleep(3600)\n"
+        "os.waitpid = wedged_waitpid\n"
+        "main()\n"
+    )
+    master, slave = os.openpty()
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                wrapper,
+                "--state-file",
+                str(state_file),
+                "--app",
+                "claude-code",
+                "--",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            time.sleep(0.5)
+            process.send_signal(signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                pytest.fail("relay blocked forever on an unreapable child")
+            assert b"Traceback" not in output, output
+            assert process.returncode == -signal.SIGKILL, output
             assert not state_file.exists()
     finally:
         os.close(master)
